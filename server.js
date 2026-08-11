@@ -286,5 +286,10 @@ app.post('/cancel-appointment', async (req, res) => {
 
 app.get('/', (req, res) => res.send('Mahir Company voice agent backend is running.'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Only run a local listener when NOT on Vercel (Vercel runs this as a serverless function instead)
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+module.exports = app;
