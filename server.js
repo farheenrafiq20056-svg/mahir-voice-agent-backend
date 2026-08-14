@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
+const { DateTime } = require('luxon');
 
 const app = express();
 app.use(express.json());
@@ -23,17 +24,18 @@ const auth = new google.auth.GoogleAuth({
 const calendar = google.calendar({ version: 'v3', auth });
 
 // ---- Helpers ----
-function toISO(date, time) {
-  // date: "2026-08-15", time: "14:00" (24hr) -> returns a Date object anchored to TIMEZONE
-  return new Date(`${date}T${time}:00`);
+// Correctly interprets "date" + "time" as wall-clock time IN the business's timezone
+// (e.g. "2026-08-14" + "17:00" means 5 PM Eastern, NOT 5 PM UTC), and handles DST automatically.
+function toZonedDateTime(date, time) {
+  return DateTime.fromFormat(`${date} ${time}`, 'yyyy-MM-dd HH:mm', { zone: TIMEZONE });
 }
 
-function addMinutes(date, minutes) {
-  return new Date(date.getTime() + minutes * 60000);
+function addMinutes(dt, minutes) {
+  return dt.plus({ minutes });
 }
 
-function withinBusinessHours(startDate) {
-  const hour = startDate.getHours();
+function withinBusinessHours(dt) {
+  const hour = dt.hour; // hour in the DateTime's own zone (already set to TIMEZONE)
   return hour >= BUSINESS_START_HOUR && hour < BUSINESS_END_HOUR;
 }
 
@@ -67,7 +69,7 @@ app.post('/check-availability', async (req, res) => {
   const { args, toolCallId } = extractArgs(req);
   try {
     const { date, time, duration_minutes } = args; // date: "2026-08-15", time: "14:00"
-    const start = toISO(date, time);
+    const start = toZonedDateTime(date, time);
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
@@ -81,8 +83,8 @@ app.post('/check-availability', async (req, res) => {
 
     const freeBusy = await calendar.freebusy.query({
       requestBody: {
-        timeMin: start.toISOString(),
-        timeMax: end.toISOString(),
+        timeMin: start.toUTC().toISO(),
+        timeMax: end.toUTC().toISO(),
         timeZone: TIMEZONE,
         items: [{ id: CALENDAR_ID }],
       },
@@ -98,8 +100,8 @@ app.post('/check-availability', async (req, res) => {
 
     return respond(res, toolCallId, {
       available: isAvailable,
-      requestedStart: start.toISOString(),
-      requestedEnd: end.toISOString(),
+      requestedStart: start.toUTC().toISO(),
+      requestedEnd: end.toUTC().toISO(),
       alternatives, // array of { time: "15:00" } style suggestions
     });
   } catch (err) {
@@ -114,12 +116,12 @@ async function findAlternativeSlots(date, durationMin, maxResults) {
   for (let hour = BUSINESS_START_HOUR; hour < BUSINESS_END_HOUR; hour++) {
     for (const minute of [0, 30]) {
       const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-      const start = toISO(date, timeStr);
+      const start = toZonedDateTime(date, timeStr);
       const end = addMinutes(start, durationMin);
       const freeBusy = await calendar.freebusy.query({
         requestBody: {
-          timeMin: start.toISOString(),
-          timeMax: end.toISOString(),
+          timeMin: start.toUTC().toISO(),
+          timeMax: end.toUTC().toISO(),
           timeZone: TIMEZONE,
           items: [{ id: CALENDAR_ID }],
         },
@@ -143,7 +145,10 @@ app.post('/book-appointment', async (req, res) => {
       address, date, time, duration_minutes,
     } = args;
 
-    const start = toISO(date, time);
+    // Log the raw incoming args so we can diagnose any missing-field issues from Vapi's tool call.
+    console.log('book-appointment received args:', JSON.stringify(args));
+
+    const start = toZonedDateTime(date, time);
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
@@ -151,12 +156,12 @@ app.post('/book-appointment', async (req, res) => {
       calendarId: CALENDAR_ID,
       requestBody: {
         summary: `${service} - ${customer_name}`,
-        description: `Issue: ${issue_description}\nAddress: ${address}\nPhone: ${phone}`,
-        start: { dateTime: start.toISOString(), timeZone: TIMEZONE },
-        end: { dateTime: end.toISOString(), timeZone: TIMEZONE },
+        description: `Issue: ${issue_description}\nAddress: ${address}\nPhone: ${phone || 'NOT PROVIDED'}`,
+        start: { dateTime: start.toUTC().toISO(), timeZone: TIMEZONE },
+        end: { dateTime: end.toUTC().toISO(), timeZone: TIMEZONE },
         // Store structured data for later lookup (reschedule/cancel by phone)
         extendedProperties: {
-          private: { phone, service, customer_name },
+          private: { phone: phone || '', service, customer_name },
         },
       },
     });
@@ -165,7 +170,7 @@ app.post('/book-appointment', async (req, res) => {
       success: true,
       eventId: event.data.id,
       bookingReference: event.data.id.slice(0, 8).toUpperCase(),
-      start: start.toISOString(),
+      start: start.toUTC().toISO(),
     });
   } catch (err) {
     console.error(err);
@@ -175,13 +180,13 @@ app.post('/book-appointment', async (req, res) => {
 
 // ---- Shared: find upcoming appointment(s) by phone number ----
 async function findAppointmentsByPhone(phone) {
-  const now = new Date();
-  const sixMonthsOut = new Date(now.getTime() + 1000 * 60 * 60 * 24 * 180);
+  const now = DateTime.now();
+  const sixMonthsOut = now.plus({ days: 180 });
   const result = await calendar.events.list({
     calendarId: CALENDAR_ID,
     privateExtendedProperty: [`phone=${phone}`],
-    timeMin: now.toISOString(),
-    timeMax: sixMonthsOut.toISOString(),
+    timeMin: now.toUTC().toISO(),
+    timeMax: sixMonthsOut.toUTC().toISO(),
     singleEvents: true,
     orderBy: 'startTime',
   });
@@ -223,7 +228,7 @@ app.post('/reschedule-appointment', async (req, res) => {
       eventId = events[0].id; // most recent upcoming appointment
     }
 
-    const start = toISO(new_date, new_time);
+    const start = toZonedDateTime(new_date, new_time);
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
@@ -234,8 +239,8 @@ app.post('/reschedule-appointment', async (req, res) => {
     // check the new slot is free first
     const freeBusy = await calendar.freebusy.query({
       requestBody: {
-        timeMin: start.toISOString(),
-        timeMax: end.toISOString(),
+        timeMin: start.toUTC().toISO(),
+        timeMax: end.toUTC().toISO(),
         timeZone: TIMEZONE,
         items: [{ id: CALENDAR_ID }],
       },
@@ -249,12 +254,12 @@ app.post('/reschedule-appointment', async (req, res) => {
       calendarId: CALENDAR_ID,
       eventId,
       requestBody: {
-        start: { dateTime: start.toISOString(), timeZone: TIMEZONE },
-        end: { dateTime: end.toISOString(), timeZone: TIMEZONE },
+        start: { dateTime: start.toUTC().toISO(), timeZone: TIMEZONE },
+        end: { dateTime: end.toUTC().toISO(), timeZone: TIMEZONE },
       },
     });
 
-    return respond(res, toolCallId, { success: true, eventId: updated.data.id, newStart: start.toISOString() });
+    return respond(res, toolCallId, { success: true, eventId: updated.data.id, newStart: start.toUTC().toISO() });
   } catch (err) {
     console.error(err);
     return respond(res, toolCallId, { success: false, error: 'internal_error' });
