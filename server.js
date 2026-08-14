@@ -26,8 +26,26 @@ const calendar = google.calendar({ version: 'v3', auth });
 // ---- Helpers ----
 // Correctly interprets "date" + "time" as wall-clock time IN the business's timezone
 // (e.g. "2026-08-14" + "17:00" means 5 PM Eastern, NOT 5 PM UTC), and handles DST automatically.
+// Tries several common time formats since the AI model doesn't always send strict 24hr "HH:mm".
 function toZonedDateTime(date, time) {
-  return DateTime.fromFormat(`${date} ${time}`, 'yyyy-MM-dd HH:mm', { zone: TIMEZONE });
+  const cleanedTime = String(time).trim();
+  const formatsToTry = [
+    'HH:mm',      // "15:00"
+    'H:mm',       // "5:00" (no leading zero)
+    'h:mm a',     // "3:00 PM"
+    'h:mma',      // "3:00PM"
+    'ha',         // "3PM"
+    'h a',        // "3 PM"
+    'HH:mm:ss',   // "15:00:00"
+  ];
+
+  for (const fmt of formatsToTry) {
+    const dt = DateTime.fromFormat(`${date} ${cleanedTime}`, `yyyy-MM-dd ${fmt}`, { zone: TIMEZONE });
+    if (dt.isValid) return dt;
+  }
+
+  // Nothing worked — return an explicitly invalid DateTime so callers can detect and report it clearly.
+  return DateTime.invalid('unparseable_time');
 }
 
 function addMinutes(dt, minutes) {
@@ -35,6 +53,7 @@ function addMinutes(dt, minutes) {
 }
 
 function withinBusinessHours(dt) {
+  if (!dt.isValid) return false;
   const hour = dt.hour; // hour in the DateTime's own zone (already set to TIMEZONE)
   return hour >= BUSINESS_START_HOUR && hour < BUSINESS_END_HOUR;
 }
@@ -70,6 +89,16 @@ app.post('/check-availability', async (req, res) => {
   try {
     const { date, time, duration_minutes } = args; // date: "2026-08-15", time: "14:00"
     const start = toZonedDateTime(date, time);
+
+    if (!start.isValid) {
+      console.error('check-availability: could not parse date/time:', JSON.stringify({ date, time }));
+      return respond(res, toolCallId, {
+        available: false,
+        reason: 'invalid_time_format',
+        message: `I couldn't understand that date/time (got date="${date}", time="${time}"). Please ask the customer to restate it clearly, e.g. "August 18th at 3 PM."`,
+      });
+    }
+
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
@@ -149,6 +178,14 @@ app.post('/book-appointment', async (req, res) => {
     console.log('book-appointment received args:', JSON.stringify(args));
 
     const start = toZonedDateTime(date, time);
+    if (!start.isValid) {
+      console.error('book-appointment: could not parse date/time:', JSON.stringify({ date, time }));
+      return respond(res, toolCallId, {
+        success: false,
+        reason: 'invalid_time_format',
+        message: `Could not understand the date/time (date="${date}", time="${time}"). Ask the customer to restate it clearly.`,
+      });
+    }
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
@@ -229,6 +266,14 @@ app.post('/reschedule-appointment', async (req, res) => {
     }
 
     const start = toZonedDateTime(new_date, new_time);
+    if (!start.isValid) {
+      console.error('reschedule-appointment: could not parse date/time:', JSON.stringify({ new_date, new_time }));
+      return respond(res, toolCallId, {
+        success: false,
+        reason: 'invalid_time_format',
+        message: `Could not understand the new date/time (date="${new_date}", time="${new_time}"). Ask the customer to restate it clearly.`,
+      });
+    }
     const durationMin = duration_minutes || DEFAULT_DURATION_MIN;
     const end = addMinutes(start, durationMin);
 
