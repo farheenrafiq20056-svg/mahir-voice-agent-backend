@@ -24,14 +24,45 @@ const auth = new google.auth.GoogleAuth({
 const calendar = google.calendar({ version: 'v3', auth });
 
 // ---- Helpers ----
-// Correctly interprets "date" + "time" as wall-clock time IN the business's timezone
-// (e.g. "2026-08-14" + "17:00" means 5 PM Eastern, NOT 5 PM UTC), and handles DST automatically.
-// Tries several common time formats since the AI model doesn't always send strict 24hr "HH:mm".
-function toZonedDateTime(date, time) {
-  const cleanedTime = String(time).trim();
+// Parses the "date" argument, trying several common formats since the AI
+// model doesn't always send strict ISO "yyyy-MM-dd".
+function parseDatePart(dateStr) {
+  const cleaned = String(dateStr).trim();
+  const formatsToTry = [
+    'yyyy-MM-dd',       // "2026-08-17"
+    'yyyy/MM/dd',       // "2026/08/17"
+    'MM/dd/yyyy',       // "08/17/2026"
+    'M/d/yyyy',         // "8/17/2026"
+    'MMMM d, yyyy',      // "August 17, 2026"
+    'MMMM d yyyy',       // "August 17 2026"
+    'MMM d, yyyy',       // "Aug 17, 2026"
+    'MMM d yyyy',        // "Aug 17 2026"
+    'MMMM d',             // "August 17" (no year — see fallback below)
+    'MMM d',              // "Aug 17"
+  ];
+
+  for (const fmt of formatsToTry) {
+    let dt = DateTime.fromFormat(cleaned, fmt, { zone: TIMEZONE });
+    if (dt.isValid) {
+      // If the format had no year (e.g. "August 17"), luxon defaults to year 0 —
+      // fix that by assuming the current year, rolling to next year if that date already passed.
+      if (!fmt.includes('yyyy')) {
+        const now = DateTime.now().setZone(TIMEZONE);
+        dt = dt.set({ year: now.year });
+        if (dt < now.startOf('day')) dt = dt.plus({ years: 1 });
+      }
+      return { year: dt.year, month: dt.month, day: dt.day };
+    }
+  }
+  return null;
+}
+
+// Parses the "time" argument, trying several common formats.
+function parseTimePart(timeStr) {
+  const cleaned = String(timeStr).trim();
   const formatsToTry = [
     'HH:mm',      // "15:00"
-    'H:mm',       // "5:00" (no leading zero)
+    'H:mm',       // "5:00"
     'h:mm a',     // "3:00 PM"
     'h:mma',      // "3:00PM"
     'ha',         // "3PM"
@@ -40,12 +71,27 @@ function toZonedDateTime(date, time) {
   ];
 
   for (const fmt of formatsToTry) {
-    const dt = DateTime.fromFormat(`${date} ${cleanedTime}`, `yyyy-MM-dd ${fmt}`, { zone: TIMEZONE });
-    if (dt.isValid) return dt;
+    const dt = DateTime.fromFormat(cleaned, fmt, { zone: TIMEZONE });
+    if (dt.isValid) return { hour: dt.hour, minute: dt.minute };
+  }
+  return null;
+}
+
+// Correctly interprets "date" + "time" as wall-clock time IN the business's timezone
+// (e.g. "2026-08-14" + "17:00" means 5 PM Eastern, NOT 5 PM UTC), and handles DST automatically.
+// Parses date and time independently for robustness, then combines them.
+function toZonedDateTime(date, time) {
+  const dateParts = parseDatePart(date);
+  const timeParts = parseTimePart(time);
+
+  if (!dateParts || !timeParts) {
+    return DateTime.invalid('unparseable_date_or_time');
   }
 
-  // Nothing worked — return an explicitly invalid DateTime so callers can detect and report it clearly.
-  return DateTime.invalid('unparseable_time');
+  return DateTime.fromObject(
+    { year: dateParts.year, month: dateParts.month, day: dateParts.day, hour: timeParts.hour, minute: timeParts.minute },
+    { zone: TIMEZONE }
+  );
 }
 
 function addMinutes(dt, minutes) {
@@ -88,6 +134,7 @@ app.post('/check-availability', async (req, res) => {
   const { args, toolCallId } = extractArgs(req);
   try {
     const { date, time, duration_minutes } = args; // date: "2026-08-15", time: "14:00"
+    console.log('check-availability received args:', JSON.stringify(args));
     const start = toZonedDateTime(date, time);
 
     if (!start.isValid) {
